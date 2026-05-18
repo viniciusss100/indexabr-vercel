@@ -241,17 +241,22 @@ async function resolveFileList(infoHash) {
   return null;
 }
 
+// CORRIGIDO: packRegex agora exige a temporada correta (sem COMPLETE genérico),
+// e epRangeRegex verifica se o episódio pedido está dentro do range do pack.
 function buildSeriesMatchers(seasonNum, episodeNum) {
-  if (!seasonNum || !episodeNum) return { epRegex: null, packRegex: null };
+  if (!seasonNum || !episodeNum) return { epRegex: null, packRegex: null, epRangeRegex: null };
 
   const s = String(seasonNum).padStart(2, "0");
 
   return {
     epRegex: new RegExp(`S${s}E0*${episodeNum}(?!\\d)|${seasonNum}x0*${episodeNum}(?!\\d)`, "i"),
+    // COMPLETE agora exige a temporada correta no título
     packRegex: new RegExp(
-      `S${s}(?!E\\d)|Temporada\\s*0*${seasonNum}(?!\\d)|S${s}E\\d+\\s*[-–]\\s*E?\\d+|COMPLETE`,
+      `S${s}(?!E\\d)|Temporada\\s*0*${seasonNum}(?!\\d)|COMPLETE.*S${s}|S${s}.*COMPLETE`,
       "i"
     ),
+    // Range de episódios da temporada correta (ex: S05E01-E09)
+    epRangeRegex: new RegExp(`S${s}E(\\d{1,3})\\s*[-–]\\s*E?(\\d{1,3})`, "i"),
   };
 }
 
@@ -283,7 +288,7 @@ function buildTorrentEntry({ sourceLabel, providerLabel, fileName, rawSize, magn
 }
 
 async function scrapeBetor(type, imdbId, seasonNum, episodeNum) {
-  const { epRegex, packRegex } = buildSeriesMatchers(seasonNum, episodeNum);
+  const { epRegex, packRegex, epRangeRegex } = buildSeriesMatchers(seasonNum, episodeNum);
 
   try {
     const { data: html } = await axios.get(`${BETOR_BASE_URL}/imdb/${imdbId}/`, {
@@ -310,9 +315,21 @@ async function scrapeBetor(type, imdbId, seasonNum, episodeNum) {
           let isSeasonPack = false;
           if (type === "series" && seasonNum && episodeNum) {
             const matchesEp = epRegex ? epRegex.test(fileName) : false;
+
+            // CORRIGIDO: verifica range de episódios (ex: S05E01-E09)
+            let matchesRange = false;
+            if (!matchesEp && epRangeRegex) {
+              const rangeMatch = fileName.match(epRangeRegex);
+              if (rangeMatch) {
+                const lo = parseInt(rangeMatch[1], 10);
+                const hi = parseInt(rangeMatch[2], 10);
+                matchesRange = episodeNum >= lo && episodeNum <= hi;
+              }
+            }
+
             const matchesPack = packRegex ? packRegex.test(fileName) : false;
-            if (!matchesEp && !matchesPack) return;
-            if (matchesPack && !matchesEp) isSeasonPack = true;
+            if (!matchesEp && !matchesRange && !matchesPack) return;
+            if (!matchesEp && !matchesRange) isSeasonPack = true;
           }
 
           const { quality, qualityScore } = detectQuality(fileName);
@@ -363,7 +380,7 @@ function extractImdbId(imdbUrl) {
 }
 
 async function scrapeThePirata(type, imdbId, seasonNum, episodeNum) {
-  const { epRegex, packRegex } = buildSeriesMatchers(seasonNum, episodeNum);
+  const { epRegex, packRegex, epRangeRegex } = buildSeriesMatchers(seasonNum, episodeNum);
 
   try {
     const catalog = await getPirataCatalog();
@@ -382,9 +399,21 @@ async function scrapeThePirata(type, imdbId, seasonNum, episodeNum) {
         let isSeasonPack = false;
         if (type === "series" && seasonNum && episodeNum) {
           const matchesEp = epRegex ? epRegex.test(fileName) : false;
+
+          // CORRIGIDO: verifica range de episódios (ex: S05E01-E09)
+          let matchesRange = false;
+          if (!matchesEp && epRangeRegex) {
+            const rangeMatch = fileName.match(epRangeRegex);
+            if (rangeMatch) {
+              const lo = parseInt(rangeMatch[1], 10);
+              const hi = parseInt(rangeMatch[2], 10);
+              matchesRange = episodeNum >= lo && episodeNum <= hi;
+            }
+          }
+
           const matchesPack = packRegex ? packRegex.test(fileName) : false;
-          if (!matchesEp && !matchesPack) continue;
-          if (matchesPack && !matchesEp) isSeasonPack = true;
+          if (!matchesEp && !matchesRange && !matchesPack) continue;
+          if (!matchesEp && !matchesRange) isSeasonPack = true;
         }
 
         const rawSize = parseSizeToBytes(file.size);
