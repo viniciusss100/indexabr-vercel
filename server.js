@@ -545,7 +545,7 @@ function mapTorrentToStream(torrent) {
     infoHash: torrent.infoHash,
     sources: ANNOUNCE_SOURCES,
     behaviorHints: {
-      filename: torrent.fileName,
+      filename: `${torrent.fileName} [seeds:${torrent.seeders || 0}]`,
     },
     _sort: (torrent.isSeasonPack ? torrent.qualityScore - 0.5 : torrent.qualityScore) + Math.min((torrent.seeders || 0) / 1000, 0.4),
   };
@@ -588,7 +588,7 @@ function filterTrash(streams) {
   });
 }
 
-const MIN_STREAM_SEEDS = Math.max(0, parseInt(process.env.MIN_STREAM_SEEDS || process.env.P2P_MIN_SEEDS || process.env.P2P_MIN_SEEDERS || "1", 10) || 0);
+const MIN_STREAM_SEEDS = parseInt(process.env.MIN_STREAM_SEEDS || process.env.P2P_MIN_SEEDS || process.env.P2P_MIN_SEEDERS || "0", 10) || 0;
 
 function filterBySeeds(streams, isDebrid) {
   if (MIN_STREAM_SEEDS <= 0) return streams;
@@ -608,7 +608,8 @@ function filterBySeeds(streams, isDebrid) {
 
     if (isDebrid && isCached) return true;
 
-    const seedMatch = textTitle.match(/👤\s*(\d+)/);
+    const filename = (s.behaviorHints && s.behaviorHints.filename) ? String(s.behaviorHints.filename) : "";
+    const seedMatch = textTitle.match(/👤\s*(\d+)/) || filename.match(/\[seeds:(\d+)\]/i);
     const seeders = seedMatch ? parseInt(seedMatch[1], 10) : 0;
     
     return seeders >= MIN_STREAM_SEEDS;
