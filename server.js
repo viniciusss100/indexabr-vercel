@@ -5,10 +5,19 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const parseTorrent = require("parse-torrent");
 const { Redis } = require("@upstash/redis");
+const http = require("http");
+const https = require("https");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Agentes otimizados para manter conexões ativas (Keep-Alive) e diminuir overhead de Handshake TLS
+const axiosInstance = axios.create({
+  timeout: 8000,
+  httpAgent: new http.Agent({ keepAlive: true }),
+  httpsAgent: new https.Agent({ keepAlive: true })
+});
 
 const redis = process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
   ? new Redis({
@@ -21,16 +30,25 @@ const memoryStore = new Map();
 
 async function kvGet(key) {
   try {
-    if (!redis) return memoryStore.has(key) ? memoryStore.get(key) : null;
-    const value = await redis.get(key);
-    return value === undefined ? null : value;
-  } catch (_) {
-    return memoryStore.has(key) ? memoryStore.get(key) : null;
+    if (redis) {
+      const value = await redis.get(key);
+      if (value !== undefined && value !== null) return value;
+    }
+  } catch (_) {}
+
+  const item = memoryStore.get(key);
+  if (!item) return null;
+  // Garbage collection manual (TTL) de memória
+  if (item.expiry && Date.now() > item.expiry) {
+    memoryStore.delete(key);
+    return null;
   }
+  return item.value;
 }
 
 async function kvSet(key, value, options = {}) {
-  memoryStore.set(key, value);
+  const expiry = options.ex ? Date.now() + options.ex * 1000 : null;
+  memoryStore.set(key, { value, expiry });
 
   try {
     if (!redis) return;
@@ -39,9 +57,7 @@ async function kvSet(key, value, options = {}) {
       return;
     }
     await redis.set(key, value);
-  } catch (_) {
-    // fallback em memória já foi salvo acima
-  }
+  } catch (_) {}
 }
 
 function toB64(obj) {
@@ -59,7 +75,7 @@ function resolveBaseUrl(req) {
 }
 
 const BETOR_BASE_URL = "https://catalogo.betor.top";
-const PIRATA_BASE_URL = "https://www.thepiratafilmes.online";
+const PIRATA_DOMAINS = ["https://catalago.online", "https://www.thepiratafilmes.online"];
 const TRASH_PATTERN = /\b(CAM|CAMRIP|HDCAM|TC|HDTC|TS|HDTS|TELESYNC|TELECINE|LEGENDADO|LEGENDA|SUB|SUBS|SUBTITLE)\b/i;
 const ANNOUNCE_SOURCES = [
   "tracker:udp://tracker.opentrackr.org:1337/announce",
@@ -97,17 +113,7 @@ function parseSizeToBytes(raw) {
 
   const value = parseFloat(match[1]);
   const unit = match[2].toUpperCase();
-  const map = {
-    B: 1,
-    KB: 1024,
-    KIB: 1024,
-    MB: 1024 ** 2,
-    MIB: 1024 ** 2,
-    GB: 1024 ** 3,
-    GIB: 1024 ** 3,
-    TB: 1024 ** 4,
-    TIB: 1024 ** 4,
-  };
+  const map = { B: 1, KB: 1024, KIB: 1024, MB: 1024 ** 2, MIB: 1024 ** 2, GB: 1024 ** 3, GIB: 1024 ** 3, TB: 1024 ** 4, TIB: 1024 ** 4 };
 
   return Math.round(value * (map[unit] || 1));
 }
@@ -143,7 +149,6 @@ function decodeMagnet(magnet) {
 
 function getInfoHash(magnet) {
   const decoded = decodeMagnet(magnet);
-
   const match = decoded.match(/btih:([a-z0-9]{32,40})/i);
   if (match) return match[1].toLowerCase();
 
@@ -159,7 +164,6 @@ function getInfoHash(magnet) {
 
 function detectAudio(fileName, fallbackLanguage) {
   const text = `${fileName || ""} ${fallbackLanguage || ""}`;
-
   if (/\b(dual(?:\s*audio)?|dual\.?|dual_)\b/i.test(text)) return "Dual";
   if (/\b(dublado|dubbed|dub\.?|brazilian|nacional|pt[-_. ]?br|ptbr|portuguese|portugues|português)\b/i.test(text)) return "Dublado";
   if (/\b(legendad|legendado|subbed|subtitles?|legenda)\b/i.test(text)) return "Legendado";
@@ -180,13 +184,11 @@ function guessEpisodeCount(fileName) {
     const diff = parseInt(m1[2], 10) - parseInt(m1[1], 10);
     if (diff > 0) return diff + 1;
   }
-
   const m2 = fileName.match(/\dx(\d{2})\s*a\s*\dx(\d{2})/i);
   if (m2) {
     const diff = parseInt(m2[2], 10) - parseInt(m2[1], 10);
     if (diff > 0) return diff + 1;
   }
-
   return null;
 }
 
@@ -198,12 +200,8 @@ function guessFileIdx(fileName, episodeNum) {
 
 function findEpisodeIdx(files, seasonNum, episodeNum) {
   if (!files?.length) return null;
-
   const videoExts = /\.(mkv|mp4|avi|m4v|ts|mov|wmv)$/i;
-  const epRegex = new RegExp(
-    `S0*${seasonNum}E0*${episodeNum}(?!\\d)|${seasonNum}x0*${episodeNum}(?!\\d)`,
-    "i"
-  );
+  const epRegex = new RegExp(`S0*${seasonNum}E0*${episodeNum}(?!\\d)|${seasonNum}x0*${episodeNum}(?!\\d)`, "i");
 
   const match = files
     .filter((file) => videoExts.test(file.name))
@@ -219,29 +217,29 @@ async function resolveFileList(infoHash) {
   const cached = await kvGet(cacheKey);
   if (cached !== null) return cached;
 
-  for (const url of TORRENT_SOURCES(infoHash)) {
-    try {
-      const res = await axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 40000,
-        headers: { "User-Agent": "Mozilla/5.0" },
-      });
+  const urls = TORRENT_SOURCES(infoHash);
+  
+  // Otimização de concorrência: tenta resolver o torrent de múltiplos providers ao mesmo tempo 
+  // e pega o primeiro que responder, anulando o gargalo sequencial.
+  const promises = urls.map(url =>
+    axiosInstance.get(url, { responseType: "arraybuffer", timeout: 5000 })
+      .then(res => parseTorrent(Buffer.from(res.data)))
+  );
 
-      const parsed = await parseTorrent(Buffer.from(res.data));
-      if (!parsed?.files?.length) continue;
-
+  try {
+    const parsed = await Promise.any(promises);
+    if (parsed?.files?.length) {
       const files = parsed.files.map((file, idx) => ({
         name: file.name,
         path: file.path || file.name,
         length: file.length,
         idx,
       }));
-
       await kvSet(cacheKey, files, { ex: 86400 });
       return files;
-    } catch (_) {
-      // tenta próxima fonte
     }
+  } catch (_) {
+    // Falha em todos os mirrors
   }
 
   await kvSet(cacheKey, null, { ex: 3600 });
@@ -250,15 +248,10 @@ async function resolveFileList(infoHash) {
 
 function buildSeriesMatchers(seasonNum, episodeNum) {
   if (!seasonNum || !episodeNum) return { epRegex: null, packRegex: null, epRangeRegex: null };
-
   const s = String(seasonNum).padStart(2, "0");
-
   return {
     epRegex: new RegExp(`S${s}E0*${episodeNum}(?!\\d)|${seasonNum}x0*${episodeNum}(?!\\d)`, "i"),
-    packRegex: new RegExp(
-      `S${s}(?!E\\d)|Temporada\\s*0*${seasonNum}(?!\\d)|COMPLETE.*S${s}|S${s}.*COMPLETE`,
-      "i"
-    ),
+    packRegex: new RegExp(`S${s}(?!E\\d)|Temporada\\s*0*${seasonNum}(?!\\d)|COMPLETE.*S${s}|S${s}.*COMPLETE`, "i"),
     epRangeRegex: new RegExp(`S${s}E(\\d{1,3})\\s*[-–]\\s*E?(\\d{1,3})`, "i"),
   };
 }
@@ -286,11 +279,14 @@ function buildTorrentEntry({ sourceLabel, providerLabel, fileName, rawSize, magn
 }
 
 async function scrapeBetor(type, imdbId, seasonNum, episodeNum) {
+  const isDown = await kvGet('circuit:betor');
+  if (isDown) return [];
+
   const { epRegex, packRegex, epRangeRegex } = buildSeriesMatchers(seasonNum, episodeNum);
 
   try {
-    const { data: html } = await axios.get(`${BETOR_BASE_URL}/imdb/${imdbId}/`, {
-      timeout: 20000,
+    const { data: html } = await axiosInstance.get(`${BETOR_BASE_URL}/imdb/${imdbId}/`, {
+      timeout: 6000,
       headers: { "User-Agent": "Mozilla/5.0" },
     });
 
@@ -332,16 +328,7 @@ async function scrapeBetor(type, imdbId, seasonNum, episodeNum) {
           const { quality, qualityScore } = detectQuality(fileName);
           const audio = detectAudio(fileName);
           const torrent = buildTorrentEntry({
-            sourceLabel: "BeTor",
-            providerLabel: `BeTor: ${providerLabel}`,
-            fileName,
-            rawSize,
-            magnet,
-            audio,
-            quality,
-            qualityScore,
-            isSeasonPack,
-            seeders,
+            sourceLabel: "BeTor", providerLabel: `BeTor: ${providerLabel}`, fileName, rawSize, magnet, audio, quality, qualityScore, isSeasonPack, seeders,
           });
 
           if (torrent) torrents.push(torrent);
@@ -350,17 +337,17 @@ async function scrapeBetor(type, imdbId, seasonNum, episodeNum) {
 
     return torrents;
   } catch (err) {
-    if (err.response?.status === 404) return [];
-    console.error(`[BeTor] ${imdbId}: ${err.message}`);
+    if (err.code === 'ECONNABORTED' || err.response?.status >= 500) {
+      // Circuit Breaker: desabilita o scrape na fonte para esta e as próximas requests por 5 minutos
+      await kvSet('circuit:betor', true, { ex: 300 });
+    }
     return [];
   }
 }
 
-// Constrói um magnet a partir de um stream Stremio que contém infoHash
 function buildMagnetFromStream(stream) {
   const hash = stream.infoHash;
   if (!hash) return null;
-
   const name = stream.behaviorHints?.filename || stream.name || hash;
   const trackers = (stream.sources || ANNOUNCE_SOURCES)
     .filter((s) => s.startsWith("tracker:"))
@@ -369,22 +356,17 @@ function buildMagnetFromStream(stream) {
   return `magnet:?xt=urn:btih:${hash}&dn=${encodeURIComponent(name)}${trackers.join("")}`;
 }
 
-// Extrai seeders do campo title do stream Stremio (ex: "👤 42")
 function extractSeedersFromTitle(title) {
   const match = String(title || "").match(/👤\s*(\d+)/);
   return match ? parseInt(match[1], 10) : 0;
 }
 
-// Extrai nome do arquivo do título ou behaviorHints do stream Stremio
 function extractFileNameFromStream(stream) {
   if (stream.behaviorHints?.filename) return stream.behaviorHints.filename;
-
-  // Primeira linha do title costuma ser o nome do arquivo
   const firstLine = String(stream.title || stream.name || "").split("\n")[0].trim();
   return firstLine || null;
 }
 
-// Extrai tamanho em bytes do título do stream (ex: "📦 1.23 GB")
 function extractRawSizeFromTitle(title) {
   const match = String(title || "").match(/([0-9]+(?:[.,][0-9]+)?)\s*(GB|MB)/i);
   if (!match) return 0;
@@ -393,88 +375,99 @@ function extractRawSizeFromTitle(title) {
   return unit === "GB" ? Math.round(value * 1024 ** 3) : Math.round(value * 1024 ** 2);
 }
 
-async function scrapeThePirata(type, imdbId, seasonNum, episodeNum) {
-  const { epRegex, packRegex, epRangeRegex } = buildSeriesMatchers(seasonNum, episodeNum);
+function processPirataBaseItem(fileName, magnet, rawSize, seeders, type, seasonNum, episodeNum, epRegex, packRegex, epRangeRegex) {
+  if (!fileName || !magnet || TRASH_PATTERN.test(fileName)) return null;
 
-  try {
-    // O site é um addon Stremio nativo — consome o endpoint /stream diretamente
-    const stremioType = type === "series" ? "series" : "movie";
-    const stremioId = (type === "series" && seasonNum && episodeNum)
-      ? `${imdbId}:${seasonNum}:${episodeNum}`
-      : imdbId;
+  const { quality, qualityScore } = detectQuality(fileName);
+  const audio = detectAudio(fileName);
 
-    const url = `${PIRATA_BASE_URL}/stream/${stremioType}/${stremioId}.json`;
-
-    const { data } = await axios.get(url, {
-      timeout: 20000,
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-      },
-    });
-
-    const streams = Array.isArray(data?.streams) ? data.streams : [];
-    const torrents = [];
-
-    for (const stream of streams) {
-      // Streams do addon podem ter infoHash direto ou magnet
-      let magnet = stream.magnet || null;
-
-      if (!magnet && stream.infoHash) {
-        magnet = buildMagnetFromStream(stream);
+  let isSeasonPack = false;
+  if (type === "series" && seasonNum && episodeNum) {
+    const matchesEp = epRegex ? epRegex.test(fileName) : false;
+    let matchesRange = false;
+    if (!matchesEp && epRangeRegex) {
+      const rangeMatch = fileName.match(epRangeRegex);
+      if (rangeMatch) {
+        const lo = parseInt(rangeMatch[1], 10);
+        const hi = parseInt(rangeMatch[2], 10);
+        matchesRange = episodeNum >= lo && episodeNum <= hi;
       }
-
-      if (!magnet) continue;
-
-      const fileName = extractFileNameFromStream(stream);
-      if (!fileName || TRASH_PATTERN.test(fileName)) continue;
-
-      const rawSize = extractRawSizeFromTitle(stream.title);
-      const seeders = extractSeedersFromTitle(stream.title);
-      const { quality, qualityScore } = detectQuality(fileName);
-      const audio = detectAudio(fileName, stream.title);
-
-      let isSeasonPack = false;
-      if (type === "series" && seasonNum && episodeNum) {
-        const matchesEp = epRegex ? epRegex.test(fileName) : false;
-
-        let matchesRange = false;
-        if (!matchesEp && epRangeRegex) {
-          const rangeMatch = fileName.match(epRangeRegex);
-          if (rangeMatch) {
-            const lo = parseInt(rangeMatch[1], 10);
-            const hi = parseInt(rangeMatch[2], 10);
-            matchesRange = episodeNum >= lo && episodeNum <= hi;
-          }
-        }
-
-        const matchesPack = packRegex ? packRegex.test(fileName) : false;
-        if (!matchesEp && !matchesRange && !matchesPack) continue;
-        if (!matchesEp && !matchesRange) isSeasonPack = true;
-      }
-
-      const torrent = buildTorrentEntry({
-        sourceLabel: "ThePirataFilmes",
-        providerLabel: "ThePirataFilmes",
-        fileName,
-        rawSize,
-        magnet,
-        audio,
-        quality,
-        qualityScore,
-        isSeasonPack,
-        seeders,
-      });
-
-      if (torrent) torrents.push(torrent);
     }
+    const matchesPack = packRegex ? packRegex.test(fileName) : false;
+    if (!matchesEp && !matchesRange && !matchesPack) return null;
+    if (!matchesEp && !matchesRange) isSeasonPack = true;
+  }
 
-    return torrents;
-  } catch (err) {
-    if (err.response?.status === 404) return [];
-    console.error(`[ThePirataFilmes] ${imdbId}: ${err.message}`);
+  return buildTorrentEntry({
+    sourceLabel: "ThePirataFilmes", providerLabel: "ThePirataFilmes", fileName, rawSize, magnet, audio, quality, qualityScore, isSeasonPack, seeders,
+  });
+}
+
+async function scrapeThePirata(type, imdbId, seasonNum, episodeNum) {
+  const isDown = await kvGet('circuit:pirata');
+  if (isDown) return []; // Desabilitado dinamicamente para evitar timeout global
+
+  const { epRegex, packRegex, epRangeRegex } = buildSeriesMatchers(seasonNum, episodeNum);
+  const torrents = [];
+  let success = false;
+
+  for (const base of PIRATA_DOMAINS) {
+    try {
+      // 1ª Tentativa: Consulta através da API nativa descrita no Prowlarr
+      const resApi = await axiosInstance.get(`${base}/api/search`, {
+        params: { imdbid: imdbId },
+        timeout: 5000,
+        headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+      }).catch(() => null);
+
+      if (resApi?.data && Array.isArray(resApi.data)) {
+        success = true;
+        for (const item of resApi.data) {
+          const magnet = item.magnet_link || item.download;
+          const fileName = item.title;
+          const rawSize = parseSizeToBytes(item.size) || 0;
+          const seeders = parseInt(item.seed_count, 10) || 0;
+          
+          const torrent = processPirataBaseItem(fileName, magnet, rawSize, seeders, type, seasonNum, episodeNum, epRegex, packRegex, epRangeRegex);
+          if (torrent) torrents.push(torrent);
+        }
+        break; // Sucesso com a API, rompe o loop
+      }
+
+      // 2ª Tentativa: Fallback nativo Stremio Stream API (legado)
+      const stremioId = (type === "series" && seasonNum && episodeNum) ? `${imdbId}:${seasonNum}:${episodeNum}` : imdbId;
+      const resStream = await axiosInstance.get(`${base}/stream/${type === "series" ? "series" : "movie"}/${stremioId}.json`, {
+        timeout: 5000,
+        headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+      }).catch(() => null);
+
+      if (resStream?.data?.streams && Array.isArray(resStream.data.streams)) {
+        success = true;
+        for (const stream of resStream.data.streams) {
+          let magnet = stream.magnet || null;
+          if (!magnet && stream.infoHash) magnet = buildMagnetFromStream(stream);
+
+          const fileName = extractFileNameFromStream(stream);
+          const rawSize = extractRawSizeFromTitle(stream.title);
+          const seeders = extractSeedersFromTitle(stream.title);
+
+          const torrent = processPirataBaseItem(fileName, magnet, rawSize, seeders, type, seasonNum, episodeNum, epRegex, packRegex, epRangeRegex);
+          if (torrent) torrents.push(torrent);
+        }
+        break;
+      }
+    } catch (err) {
+      // Falha transparente, tenta o próximo domínio base
+    }
+  }
+
+  if (!success) {
+    // Se ambos os domínios (e rotas) falharam, desliga a requisição para o Pirata via Circuit Breaker
+    await kvSet('circuit:pirata', true, { ex: 300 }); // Retoma as tentativas após 5 minutos
     return [];
   }
+
+  return torrents;
 }
 
 async function resolvePackFileIndexes(torrents, seasonNum, episodeNum) {
@@ -599,10 +592,14 @@ async function scrapeAllSources(type, fullId) {
   const cached = await kvGet(cacheKey);
   if (Array.isArray(cached)) return cached;
 
-  const [betor, pirata] = await Promise.all([
+  // Modificado para allSettled: Independência de falhas críticas entre scrapers
+  const results = await Promise.allSettled([
     scrapeBetor(type, imdbId, seasonNum, episodeNum),
     scrapeThePirata(type, imdbId, seasonNum, episodeNum),
   ]);
+
+  const betor = results[0].status === "fulfilled" ? results[0].value : [];
+  const pirata = results[1].status === "fulfilled" ? results[1].value : [];
 
   const resolved = await resolvePackFileIndexes(dedupeTorrents([...betor, ...pirata]), seasonNum, episodeNum);
   const streams = resolved
@@ -632,12 +629,8 @@ function filterBySeeds(streams, isDebrid) {
     const textTitle = (s.title || "").toLowerCase();
 
     const isCached = isDebrid && (
-      textName.includes("+") ||
-      textName.includes("⚡") ||
-      textName.includes("cached") ||
-      textTitle.includes("⚡") ||
-      textTitle.includes("cached") ||
-      /\[[a-z]{2}\+\]/i.test(textName)
+      textName.includes("+") || textName.includes("⚡") || textName.includes("cached") ||
+      textTitle.includes("⚡") || textTitle.includes("cached") || /\[[a-z]{2}\+\]/i.test(textName)
     );
 
     if (isDebrid && isCached) return true;
@@ -679,8 +672,7 @@ function dedupeStreams(streams) {
     const fullText = [stream.name, stream.title, stream.behaviorHints?.filename].filter(Boolean).join(" ");
     const hash = stream.infoHash ? stream.infoHash.toLowerCase() : null;
     const filename = stream.behaviorHints?.filename
-      ? stream.behaviorHints.filename.toLowerCase().replace(/\.[^.]+$/, "")
-      : null;
+      ? stream.behaviorHints.filename.toLowerCase().replace(/\.[^.]+$/, "") : null;
     const size = extractSize(fullText);
     const res = extractRes(fullText);
     const sizeKey = size ? `${size}_${res}` : null;
@@ -698,7 +690,6 @@ function dedupeStreams(streams) {
 
     result.push(stream);
   }
-
   return result;
 }
 
@@ -743,17 +734,14 @@ async function fetchUpstream(upstream, stores, type, imdb, timeoutMs, torrentOnl
   const url = `https://stremthru.stremio.ru/stremio/wrap/${encodeURIComponent(toB64(wrapper))}/stream/${type}/${imdb}.json`;
 
   try {
-    const { data } = await axios.get(url, {
+    const { data } = await axiosInstance.get(url, {
       timeout: timeoutMs,
       headers: { "User-Agent": "IndexaBRAddon/2.0" },
     });
     return data.streams || [];
   } catch (err) {
-    if (err.response) {
-      console.log(`🔍 [${upstream.name}] HTTP ${err.response.status}`);
-    } else {
-      console.log(`🔍 [${upstream.name}] Erro: ${err.message}`);
-    }
+    if (err.response) console.log(`🔍 [${upstream.name}] HTTP ${err.response.status}`);
+    else console.log(`🔍 [${upstream.name}] Erro: ${err.message}`);
     return [];
   }
 }
@@ -772,16 +760,9 @@ app.get("/manifest.json", (req, res) => {
     description: "Streams brasileiros via scraping interno de BeTor e ThePirataFilmes, com suporte a debrid e torrent direto.",
     logo: `${resolveBaseUrl(req)}/indexabr.svg`,
     types: ["movie", "series"],
-    resources: [{
-      name: "stream",
-      types: ["movie", "series"],
-      idPrefixes: ["tt"],
-    }],
+    resources: [{ name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] }],
     catalogs: [],
-    behaviorHints: {
-      configurable: true,
-      configurationRequired: true,
-    },
+    behaviorHints: { configurable: true, configurationRequired: true },
   });
 });
 
@@ -792,16 +773,9 @@ app.get("/internal/manifest.json", (req, res) => {
     name: "IndexaBR Internal",
     description: "Upstream interno do IndexaBR",
     types: ["movie", "series"],
-    resources: [{
-      name: "stream",
-      types: ["movie", "series"],
-      idPrefixes: ["tt"],
-    }],
+    resources: [{ name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] }],
     catalogs: [],
-    behaviorHints: {
-      configurable: false,
-      configurationRequired: false,
-    },
+    behaviorHints: { configurable: false, configurationRequired: false },
   });
 });
 
@@ -830,16 +804,9 @@ app.get("/:id/manifest.json", async (req, res) => {
       description: `Streams brasileiros via BeTor e ThePirataFilmes${cfg.torrentOnly ? " (modo torrent direto)" : " com debrid"}`,
       logo: `${resolveBaseUrl(req)}/indexabr.svg`,
       types: ["movie", "series"],
-      resources: [{
-        name: "stream",
-        types: ["movie", "series"],
-        idPrefixes: ["tt"],
-      }],
+      resources: [{ name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] }],
       catalogs: [],
-      behaviorHints: {
-        configurable: true,
-        configurationRequired: false,
-      },
+      behaviorHints: { configurable: true, configurationRequired: false },
     });
   } catch (err) {
     console.error("Manifest error:", err);
@@ -874,10 +841,11 @@ app.get("/:id/stream/:type/:imdb.json", async (req, res) => {
         resolve([...accumulated]);
       };
 
-      const globalTimer = setTimeout(done, 13000);
+      // Tempo de segurança ajustado p/ respeitar o limite padrão de execuções Vercel (10s)
+      const globalTimer = setTimeout(done, 8500);
 
       upstreams.forEach((upstream) => {
-        fetchUpstream(upstream, stores, type, imdb, 20000, torrentOnly)
+        fetchUpstream(upstream, stores, type, imdb, 8000, torrentOnly)
           .then((streams) => accumulated.push(...streams))
           .finally(() => {
             finished += 1;
@@ -895,7 +863,7 @@ app.get("/:id/stream/:type/:imdb.json", async (req, res) => {
     (async () => {
       try {
         const results = await Promise.allSettled(
-          upstreams.map((upstream) => fetchUpstream(upstream, stores, type, imdb, 50000, torrentOnly))
+          upstreams.map((upstream) => fetchUpstream(upstream, stores, type, imdb, 12000, torrentOnly))
         );
 
         const allStreams = results
